@@ -74,7 +74,9 @@ socket2 = { workspace = true, features = ["all"] }
 humantime.workspace = true
 human_bytes.workspace = true
 eyre.workspace = true
+async-trait.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+clickhouse.workspace = true
 lz4.workspace = true
 zstd.workspace = true
 serde.workspace = true

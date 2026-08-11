@@ -490,6 +490,8 @@ blake3 = "1.8"
 brotli = "8"
 cfg-if = "1.0"
 clap = "4"
+# EIP-8188 prototype: `reth db inject-periods` ClickHouse source (crates/cli/commands).
+clickhouse = "0.13"
 color-eyre = "0.6"
 dashmap = "6.2"
 derive_more = { version = "2", default-features = false, features = ["full"] }

@@ -15,8 +15,13 @@ mod clear;
 mod copy;
 mod diff;
 mod get;
+mod inject_periods;
+mod inspect_periods;
 mod list;
 mod migrate_v2;
+mod periods_clickhouse;
+mod periods_file;
+mod periods_source;
 mod prune_checkpoints;
 mod repair_trie;
 mod settings;
@@ -81,6 +86,12 @@ pub enum Subcommands {
     /// Migrate storage layout from v1 (MDBX-only) to v2 (static files + RocksDB)
     #[command(name = "migrate-v2")]
     MigrateV2(migrate_v2::Command),
+    /// EIP-8188 prototype: backfill last-written-block metadata into sibling tables
+    #[command(name = "inject-periods")]
+    InjectPeriods(inject_periods::Command),
+    /// EIP-8188 prototype: report last-written-block statistics
+    #[command(name = "inspect-periods")]
+    InspectPeriods(inspect_periods::Command),
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C> {
@@ -241,6 +252,18 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
 
                 // Migrate changesets+receipts, clear tables, compact MDBX
                 command.execute::<N>(provider_factory).await?;
+            }
+            Subcommands::InjectPeriods(command) => {
+                let access_rights =
+                    if command.dry_run { AccessRights::RO } else { AccessRights::RW };
+                db_exec!(self.env, tool, N, access_rights, {
+                    command.execute(&tool).await?;
+                });
+            }
+            Subcommands::InspectPeriods(command) => {
+                db_exec!(self.env, tool, N, AccessRights::RO, {
+                    command.execute(&tool)?;
+                });
             }
         }
 

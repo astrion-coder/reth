@@ -18,7 +18,7 @@ pub use raw::{RawDupSort, RawKey, RawTable, RawValue, TableRawRow};
 
 use crate::{
     models::{
-        accounts::BlockNumberAddress,
+        accounts::{AddressStorageKey, BlockNumberAddress},
         blocks::{HeaderHash, StoredBlockOmmers},
         storage_sharded_key::StorageShardedKey,
         AccountBeforeTx, ClientVersion, CompactU256, IntegerList, ShardedKey,
@@ -392,11 +392,34 @@ tables! {
         type Value = Account;
     }
 
+    /// EIP-8188 prototype: last block at which an account was written (balance, nonce,
+    /// storage, or code change), backfilled by `reth db inject-periods`. A sibling table
+    /// rather than a field on [`Account`] — `Account` is constructed via ~150 exhaustive
+    /// struct literals across most of reth's subsystems (execution, hashing, pruning, trie,
+    /// RPC, ...), so widening it in place, while technically byte-compatible via `Compact`'s
+    /// spare bitfield-header padding, would require touching nearly every one of those call
+    /// sites. A sibling table keeps this prototype's footprint contained to its own files.
+    /// Absence of a row (or of this table) means "unknown", not "never written".
+    table AccountLastWritten {
+        type Key = Address;
+        type Value = BlockNumber;
+    }
+
     /// Stores the current value of a storage key.
     table PlainStorageState {
         type Key = Address;
         type Value = StorageEntry;
         type SubKey = B256;
+    }
+
+    /// EIP-8188 prototype: last block at which a storage slot was written, backfilled by
+    /// `reth db inject-periods`. A sibling table rather than a field on [`StorageEntry`]
+    /// because `StorageEntry`'s `Compact` encoding is hand-written (needed for `DupSort`
+    /// seek-by-subkey) with no spare bit or tag to extend without an unconditional rewrite
+    /// of every row. Absence of a row (or of this table) means "unknown", not "never written".
+    table StorageLastWritten {
+        type Key = AddressStorageKey;
+        type Value = BlockNumber;
     }
 
     /// Stores pointers to block changeset with changes for each account key.
