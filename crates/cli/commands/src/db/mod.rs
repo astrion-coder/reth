@@ -15,6 +15,8 @@ mod clear;
 mod copy;
 mod diff;
 mod get;
+mod identify_inactive;
+mod inactive_identifier;
 mod inject_periods;
 mod inspect_periods;
 mod list;
@@ -92,6 +94,9 @@ pub enum Subcommands {
     /// EIP-8188 prototype: report last-written-block statistics
     #[command(name = "inspect-periods")]
     InspectPeriods(inspect_periods::Command),
+    /// EIP-8295 prototype: report maximal inactive trie subtrees
+    #[command(name = "identify-inactive")]
+    IdentifyInactive(identify_inactive::Command),
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C> {
@@ -261,6 +266,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 });
             }
             Subcommands::InspectPeriods(command) => {
+                db_exec!(self.env, tool, N, AccessRights::RO, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::IdentifyInactive(command) => {
                 db_exec!(self.env, tool, N, AccessRights::RO, {
                     command.execute(&tool)?;
                 });
