@@ -22,6 +22,12 @@ pub(crate) struct ClickHouseConfig {
     pub(crate) user: String,
     pub(crate) password: String,
     pub(crate) database: String,
+    /// Value of the `meta_network_name` column identifying the target chain (e.g.
+    /// `"sepolia"`). Required: some xatu-cbt-schema deployments host multiple networks'
+    /// `canonical_execution_*` rows in a single database (no default database-per-network
+    /// separation), so every query below filters on this explicitly rather than assuming the
+    /// configured database is already scoped to one chain.
+    pub(crate) network: String,
 }
 
 /// Queries `canonical_execution_*` diff tables, unioning them for accounts and reading
@@ -29,6 +35,7 @@ pub(crate) struct ClickHouseConfig {
 /// so the injector never needs to dedupe.
 pub(crate) struct ClickHouseSource {
     client: Client,
+    network: String,
 }
 
 impl ClickHouseSource {
@@ -39,7 +46,7 @@ impl ClickHouseSource {
             .with_user(cfg.user)
             .with_password(cfg.password)
             .with_database(cfg.database);
-        Self { client }
+        Self { client, network: cfg.network }
     }
 }
 
@@ -69,16 +76,16 @@ impl Source for ClickHouseSource {
             SELECT lower(address) AS addr, max(block_number) AS block
             FROM (
                 SELECT address, block_number FROM canonical_execution_balance_diffs
-                    WHERE block_number >= ? AND block_number <= ?
+                    WHERE block_number >= ? AND block_number <= ? AND meta_network_name = ?
                 UNION ALL
                 SELECT address, block_number FROM canonical_execution_nonce_diffs
-                    WHERE block_number >= ? AND block_number <= ?
+                    WHERE block_number >= ? AND block_number <= ? AND meta_network_name = ?
                 UNION ALL
                 SELECT address, block_number FROM canonical_execution_storage_diffs
-                    WHERE block_number >= ? AND block_number <= ?
+                    WHERE block_number >= ? AND block_number <= ? AND meta_network_name = ?
                 UNION ALL
                 SELECT contract_address AS address, block_number FROM canonical_execution_contracts
-                    WHERE block_number >= ? AND block_number <= ?
+                    WHERE block_number >= ? AND block_number <= ? AND meta_network_name = ?
             )
             GROUP BY addr
         ";
@@ -87,12 +94,16 @@ impl Source for ClickHouseSource {
             .query(QUERY)
             .bind(start_block)
             .bind(end_block)
+            .bind(&self.network)
             .bind(start_block)
             .bind(end_block)
+            .bind(&self.network)
             .bind(start_block)
             .bind(end_block)
+            .bind(&self.network)
             .bind(start_block)
             .bind(end_block)
+            .bind(&self.network)
             .fetch_all()
             .await?;
 
@@ -110,12 +121,18 @@ impl Source for ClickHouseSource {
         const QUERY: &str = r"
             SELECT lower(address) AS addr, lower(slot) AS slot_key, max(block_number) AS block
             FROM canonical_execution_storage_diffs
-            WHERE block_number >= ? AND block_number <= ?
+            WHERE block_number >= ? AND block_number <= ? AND meta_network_name = ?
               AND to_value != '0x0' AND to_value != '0x00' AND to_value != '0'
             GROUP BY addr, slot_key
         ";
-        let rows: Vec<StorageDiffRow> =
-            self.client.query(QUERY).bind(start_block).bind(end_block).fetch_all().await?;
+        let rows: Vec<StorageDiffRow> = self
+            .client
+            .query(QUERY)
+            .bind(start_block)
+            .bind(end_block)
+            .bind(&self.network)
+            .fetch_all()
+            .await?;
 
         rows.into_iter()
             .map(|row| {

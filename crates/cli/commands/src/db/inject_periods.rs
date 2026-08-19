@@ -57,6 +57,13 @@ pub struct Command {
     #[arg(long, env = "EIP8188_CLICKHOUSE_DATABASE", default_value = "default")]
     clickhouse_database: String,
 
+    /// Value of the `meta_network_name` column identifying the target chain (e.g.
+    /// `"sepolia"`). Required when `--source clickhouse`: some deployments host multiple
+    /// networks' `canonical_execution_*` rows in one database, so this is never assumed from
+    /// `--chain` or defaulted.
+    #[arg(long, env = "EIP8188_CLICKHOUSE_NETWORK")]
+    clickhouse_network: Option<String>,
+
     /// Block number at which EIP-8188 period tracking begins (also the lower bound of the
     /// diff query range).
     #[arg(long)]
@@ -137,12 +144,16 @@ impl Command {
                 let host = self.clickhouse_host.clone().ok_or_else(|| {
                     eyre::eyre!("--clickhouse-host is required when --source clickhouse")
                 })?;
+                let network = self.clickhouse_network.clone().ok_or_else(|| {
+                    eyre::eyre!("--clickhouse-network is required when --source clickhouse")
+                })?;
                 Ok(Box::new(ClickHouseSource::new(ClickHouseConfig {
                     host,
                     port: self.clickhouse_port,
                     user: self.clickhouse_user.clone(),
                     password: self.clickhouse_password.clone(),
                     database: self.clickhouse_database.clone(),
+                    network,
                 })))
             }
             src => {
