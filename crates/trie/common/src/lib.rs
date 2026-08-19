@@ -36,6 +36,11 @@ pub use constants::*;
 mod account;
 pub use account::TrieAccount;
 
+/// EIP-8188/8295 prototype: cold-storage stub pointer, used as the `AccountTrieStubs`/
+/// `StorageTrieStubs` table value type.
+mod cold_stub;
+pub use cold_stub::ColdStub;
+
 /// V2 proof targets and chunking.
 pub mod target_v2;
 pub use target_v2::{

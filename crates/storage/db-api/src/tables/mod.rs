@@ -18,7 +18,7 @@ pub use raw::{RawDupSort, RawKey, RawTable, RawValue, TableRawRow};
 
 use crate::{
     models::{
-        accounts::{AddressStorageKey, BlockNumberAddress},
+        accounts::{AddressStorageKey, BlockNumberAddress, StorageTrieStubKey},
         blocks::{HeaderHash, StoredBlockOmmers},
         storage_sharded_key::StorageShardedKey,
         AccountBeforeTx, ClientVersion, CompactU256, IntegerList, ShardedKey,
@@ -33,8 +33,8 @@ use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{
-    BranchNodeCompact, PackedStorageTrieEntry, PackedStoredNibbles, PackedStoredNibblesSubKey,
-    StorageTrieEntry, StoredNibbles, StoredNibblesSubKey,
+    BranchNodeCompact, ColdStub, PackedStorageTrieEntry, PackedStoredNibbles,
+    PackedStoredNibblesSubKey, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -514,6 +514,29 @@ tables! {
         type Key = B256;
         type Value = StorageTrieEntry;
         type SubKey = StoredNibblesSubKey;
+    }
+
+    /// EIP-8188/8295 prototype: cold-storage stub pointers for converted account-trie subtrees,
+    /// written by `reth db convert-inactive`. A sibling table rather than a variant on
+    /// `AccountsTrie`'s own `BranchNodeCompact` value encoding (owned by an external crate,
+    /// with no marker byte to repurpose) — the row's existence at a path is the stub marker.
+    /// Converting a subtree deletes its rows (including the root) from `AccountsTrie` and
+    /// inserts one row here at the same key. Absence of a row means "not converted", not
+    /// "definitely present in `AccountsTrie`" — see `crates/cli/commands/src/db/
+    /// convert_inactive.rs`'s module docs for the full scope/limitations of what this table
+    /// does and doesn't imply about live read-path correctness.
+    table AccountTrieStubs {
+        type Key = StoredNibbles;
+        type Value = ColdStub;
+    }
+
+    /// EIP-8188/8295 prototype: cold-storage stub pointers for converted storage-trie subtrees.
+    /// See [`AccountTrieStubs`] for the design rationale; keyed by [`StorageTrieStubKey`]
+    /// (owner concatenated with path) rather than `StoragesTrie`'s `DupSort` shape, since this
+    /// table only needs owner-prefix scans, not seek-by-subkey.
+    table StorageTrieStubs {
+        type Key = StorageTrieStubKey;
+        type Value = ColdStub;
     }
 
     /// Stores the transaction sender for each canonical transaction.

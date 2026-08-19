@@ -5,7 +5,8 @@ use crate::{
     table::{Decode, Encode},
     DatabaseError,
 };
-use alloy_primitives::{Address, BlockNumber, StorageKey};
+use alloy_primitives::{Address, BlockNumber, StorageKey, B256};
+use reth_trie_common::StoredNibblesSubKey;
 use serde::{Deserialize, Serialize};
 use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
 
@@ -140,6 +141,45 @@ impl Decode for AddressStorageKey {
 }
 
 impl_fixed_arbitrary!((BlockNumberAddress, 28), (AddressStorageKey, 52));
+
+/// Hashed storage owner ([`B256`]) concatenated with a storage trie path ([`StoredNibblesSubKey`]).
+/// EIP-8188/8295 prototype: key for the `StorageTrieStubs` table (see
+/// `crates/cli/commands/src/db/convert_inactive.rs`).
+///
+/// A plain (non-`DupSort`) composite key rather than `StoragesTrie`'s `DupSort` shape — the
+/// owner's bytes sort first, so a cursor seek to `(owner, empty path)` followed by `.next()`
+/// while the owner matches still enumerates one owner's stub rows in path order, which is all
+/// `convert-inactive` needs (checking for an already-stubbed descendant path); it doesn't need
+/// `DupSort`'s seek-by-subkey support.
+///
+/// Since it's used as a key, it isn't compressed when encoding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd, Hash)]
+pub struct StorageTrieStubKey(pub (B256, StoredNibblesSubKey));
+
+impl Encode for StorageTrieStubKey {
+    type Encoded = [u8; 97];
+
+    fn encode(self) -> Self::Encoded {
+        let owner = self.0 .0;
+        let path = self.0 .1;
+
+        let mut buf = [0u8; 97];
+        buf[..32].copy_from_slice(owner.as_slice());
+        buf[32..].copy_from_slice(&path.to_compact_array());
+        buf
+    }
+}
+
+impl Decode for StorageTrieStubKey {
+    fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+        let owner = B256::from_slice(&value[..32]);
+        let len = value[32 + 64] as usize;
+        let path = StoredNibblesSubKey(reth_trie_common::Nibbles::from_nibbles_unchecked(
+            &value[32..32 + len],
+        ));
+        Ok(Self((owner, path)))
+    }
+}
 
 #[cfg(test)]
 mod tests {

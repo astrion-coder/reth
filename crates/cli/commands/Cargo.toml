@@ -64,6 +64,7 @@ alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-consensus.workspace = true
 alloy-chains.workspace = true
+alloy-trie.workspace = true
 
 itertools.workspace = true
 futures.workspace = true

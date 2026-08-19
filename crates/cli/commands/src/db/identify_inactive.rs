@@ -15,7 +15,7 @@ use clap::Parser;
 use reth_db_api::database::Database;
 use reth_db_common::DbTool;
 use reth_provider::{providers::ProviderNodeTypes, HeaderProvider};
-use reth_storage_api::{BlockNumReader, StorageSettingsCache};
+use reth_storage_api::BlockNumReader;
 use std::{
     fs::File,
     io::{self, BufWriter, Write},
@@ -25,10 +25,9 @@ use tracing::info;
 
 /// The arguments for the `reth db identify-inactive` command.
 ///
-/// Known limitation: `AccountsTrie`/`StoragesTrie` are an incremental cache for fast re-hashing,
-/// not a guaranteed-complete structural mirror of the trie, so this walk can only discover leaves
-/// reachable through whatever happens to be cached. Reported inactive subtrees are a lower
-/// bound, not exhaustive — confirmed via live testing (see `inactive_identifier` module docs).
+/// Walks the complete account and storage tries, recomputed from `HashedAccounts`/
+/// `HashedStorages` rather than read from the persisted `AccountsTrie`/`StoragesTrie` cache — see
+/// the `inactive_identifier` module docs for why that distinction matters.
 #[derive(Parser, Debug)]
 pub struct Command {
     /// Block number at which EIP-8188 period tracking begins. Used to derive the current period
@@ -95,17 +94,9 @@ impl Command {
         let tx = db.tx()?;
         let period_index = PeriodIndex::build(&tx)?;
 
-        let (subtrees, stats) = reth_trie_db::with_adapter!(tool.provider_factory, |A| {
-            let hashed_cursor_factory = reth_trie_db::DatabaseHashedCursorFactory::new(&tx);
-            let trie_cursor_factory = reth_trie_db::DatabaseTrieCursorFactory::<_, A>::new(&tx);
-            identify(
-                &trie_cursor_factory,
-                &hashed_cursor_factory,
-                state_root,
-                &period_index,
-                &config,
-            )?
-        });
+        let hashed_cursor_factory = reth_trie_db::DatabaseHashedCursorFactory::new(&tx);
+        let (subtrees, stats) =
+            identify(hashed_cursor_factory, state_root, &period_index, &config)?;
 
         let mut out: Box<dyn Write> = match &self.output {
             Some(path) => Box::new(BufWriter::new(File::create(path)?)),

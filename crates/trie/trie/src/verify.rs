@@ -16,16 +16,21 @@ use reth_storage_errors::db::DatabaseError;
 use std::cmp::{Ordering, Reverse};
 use tracing::trace;
 
-/// Used by [`StateRootBranchNodesIter`] to iterate over branch nodes in a state root.
+/// A branch node produced by [`StateRootBranchNodesIter`], tagged with which trie it belongs to.
 #[derive(Debug)]
-enum BranchNode {
+pub enum BranchNode {
+    /// A branch node from the account trie.
     Account(Nibbles, BranchNodeCompact),
+    /// A branch node from a storage trie, tagged with the hashed address of its owning account.
     Storage(B256, Nibbles, BranchNodeCompact),
 }
 
-/// Iterates over branch nodes produced by a [`StateRoot`]. The `StateRoot` will only used the
-/// hashed accounts/storages tables, meaning it is recomputing the trie from scratch without the use
-/// of the trie tables.
+/// Iterates over every branch node in the complete account and storage tries, recomputing them
+/// from scratch via a [`StateRoot`] driven only by the hashed accounts/storages tables — it never
+/// reads the persisted trie tables (`AccountsTrie`/`StoragesTrie`), which are an incremental cache
+/// for fast re-hashing rather than a guaranteed-complete structural mirror of the trie. Useful
+/// anywhere a genuinely exhaustive walk is needed instead of a fast structural read of whatever
+/// happens to be cached; [`Verifier`] uses it as its ground-truth comparison stream.
 ///
 /// [`BranchNode`]s are iterated over such that:
 /// * Account nodes and storage nodes may be interleaved.
@@ -35,7 +40,7 @@ enum BranchNode {
 ///   started. In other words, if the current storage account is not equal to the previous, the
 ///   previous has no more nodes.
 #[derive(Debug)]
-struct StateRootBranchNodesIter<H> {
+pub struct StateRootBranchNodesIter<H> {
     hashed_cursor_factory: H,
     account_nodes: Vec<(Nibbles, BranchNodeCompact)>,
     storage_tries: Vec<(B256, Vec<(Nibbles, BranchNodeCompact)>)>,
@@ -45,7 +50,8 @@ struct StateRootBranchNodesIter<H> {
 }
 
 impl<H> StateRootBranchNodesIter<H> {
-    fn new(hashed_cursor_factory: H) -> Self {
+    /// Creates a new iterator, recomputing the trie from `hashed_cursor_factory` from scratch.
+    pub fn new(hashed_cursor_factory: H) -> Self {
         Self {
             hashed_cursor_factory,
             account_nodes: Default::default(),

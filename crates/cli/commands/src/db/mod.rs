@@ -12,6 +12,7 @@ use std::{
 mod account_storage;
 mod checksum;
 mod clear;
+mod convert_inactive;
 mod copy;
 mod diff;
 mod get;
@@ -97,6 +98,9 @@ pub enum Subcommands {
     /// EIP-8295 prototype: report maximal inactive trie subtrees
     #[command(name = "identify-inactive")]
     IdentifyInactive(identify_inactive::Command),
+    /// EIP-8188/8295 prototype: move identified inactive subtrees to cold storage
+    #[command(name = "convert-inactive")]
+    ConvertInactive(convert_inactive::Command),
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C> {
@@ -272,6 +276,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
             }
             Subcommands::IdentifyInactive(command) => {
                 db_exec!(self.env, tool, N, AccessRights::RO, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::ConvertInactive(command) => {
+                let access_rights =
+                    if command.dry_run { AccessRights::RO } else { AccessRights::RW };
+                db_exec!(self.env, tool, N, access_rights, {
                     command.execute(&tool)?;
                 });
             }

@@ -1,40 +1,40 @@
-//! Core algorithm for `reth db identify-inactive` — walks the persisted account trie (and, per
-//! [`Scope`], per-account storage tries) via [`DepthFirstTrieIterator`] to find maximal subtrees
-//! whose leaves are all "inactive" (`current_period - leaf_period >= inactive_min_age`),
-//! returning them as [`InactiveSubtree`]s. Read-only; never mutates the database. Mirrors
-//! go-ethereum's `identifier.go` (`cmd/geth/eip8188/identifier.go`), including the bottom-up
-//! double-counting fix from `384d5dd7e`.
+//! Core algorithm for `reth db identify-inactive` — walks the complete account trie (and, per
+//! [`Scope`], per-account storage tries) to find maximal subtrees whose leaves are all "inactive"
+//! (`current_period - leaf_period >= inactive_min_age`), returning them as [`InactiveSubtree`]s.
+//! Read-only; never mutates the database. Mirrors go-ethereum's `identifier.go`
+//! (`cmd/geth/eip8188/identifier.go`), including the bottom-up double-counting fix from
+//! `384d5dd7e`.
 //!
-//! Reth's persisted trie (`AccountsTrie`/`StoragesTrie`) only stores branch nodes — leaves live
-//! solely in `HashedAccounts`/`HashedStorages`, discovered per branch node via the
-//! `state_mask`/`tree_mask` bit difference (a nibble present in `state_mask` but absent from
-//! `tree_mask` is a direct leaf child). A branch node's own hash is not self-described either:
-//! it is known only from its *parent's* `hash_mask`/`hashes` (or, for the true trie root, from
-//! `BranchNodeCompact::root_hash`). Both quirks are handled in [`walk_account_trie`] /
-//! [`walk_storage_trie`] below.
+//! The walk is driven by [`StateRootBranchNodesIter`], which recomputes the entire trie from
+//! `HashedAccounts`/`HashedStorages` via `StateRoot::root_with_progress`/`HashBuilder` rather than
+//! reading the persisted `AccountsTrie`/`StoragesTrie` tables — those tables are an incremental
+//! cache for fast re-hashing, not a guaranteed-complete structural mirror of the trie in general,
+//! so recomputing from the hashed tables is the more robust source in cases where the two diverge
+//! (on a freshly-initialized datadir they don't diverge at all — `reth db repair-trie` confirms
+//! the persisted cache already matches a fresh recompute exactly — but a synced node's cache can).
 //!
-//! **Known limitation, confirmed via live testing against a real datadir**: `AccountsTrie`/
-//! `StoragesTrie` are an *incremental cache* for fast re-hashing, not a guaranteed-complete
-//! structural mirror of the trie — the same reason `TrieNodeIter` (deliberately not used here,
-//! see below) can skip whole subtrees for incremental hash updates. A `tree_mask` bit being
-//! clear does not reliably mean "exactly one leaf here"; it can also mean
-//! "an entire subtree is uncached," which this walk has no way to detect or descend into (a
-//! `resolve_leaf` seek still succeeds — it just silently returns the *first* hashed entry under
-//! that prefix, not necessarily the *only* one). Confirmed against a freshly-initialized mainnet
-//! genesis datadir (8893 accounts): only 4543 were reachable this way, with zero seek/prefix
-//! mismatches reported (ruling out a bug in [`resolve_leaf`] itself) — the other ~4350 accounts
-//! simply live in parts of the trie nothing here ever visits. Reported inactive subtrees are
-//! therefore a **lower bound**, not exhaustive — this walk will not find every inactive subtree
-//! that exists, only the ones reachable through whatever happens to be cached. A fully exhaustive
-//! port would need to drive the walk from a full trie recomputation
-//! (`StateRoot::root_with_progress` /`HashBuilder`, the technique
-//! `crates/trie/trie/src/verify.rs`'s `StateRootBranchNodesIter` uses) built purely from
-//! `HashedAccounts`/`HashedStorages`, which is structurally complete but a full trie rebuild rather
-//! than a fast structural read — a materially heavier operation, deliberately out of scope for this
-//! prototype.
+//! `StateRootBranchNodesIter` only yields branch nodes, not leaves. Per branch node, each of the
+//! 16 nibbles falls into one of two cases, using [`alloy_trie::BranchNodeCompact`]'s masks:
+//! * `state_mask` clear: no child at all.
+//! * `state_mask` set, `tree_mask` set: the child is itself a branch node that will arrive later as
+//!   its own [`BranchNode`] stream item — handled by [`pop_closed_children`]/[`fold_child`].
+//! * `state_mask` set, `tree_mask` clear: everything else — genuinely could be a single leaf, or a
+//!   real multi-leaf branch. Two earlier versions of this code got this case wrong in different
+//!   ways: the first assumed `tree_mask` clear always meant exactly one leaf and undercounted by
+//!   nearly half; the second tried checking `hash_mask` instead (set whenever alloy-trie's
+//!   `store_branch_node` pushes a branch node's hash directly) — an improvement, but alloy-trie's
+//!   `HashBuilder::update_masks` *clears* `hash_mask` again whenever an extension node (a
+//!   shared-nibble-prefix run) sits between this position and the branch, so a real multi-leaf
+//!   branch reached via an extension still looks mask-identical to a single leaf. There is no mask
+//!   combination at this level that reliably tells the two apart — [`scan_leaf_cluster`] resolves
+//!   it by always scanning forward from the seek point rather than trusting masks, using
+//!   `hash_mask`/`hash_for_nibble` only to decide whether a found multi-leaf cluster has a real
+//!   hash of its own (for [`fold_child`] to use) or must be inherited into a larger ancestor
+//!   candidate instead. See [`walk`]'s nibble-scan loops.
 
 use crate::db::periods_source::compute_period;
 use alloy_primitives::{keccak256, Address, BlockNumber, B256};
+use alloy_trie::BranchNodeCompact;
 use reth_db_api::{
     cursor::DbCursorRO,
     table::{Decode, Decompress},
@@ -44,7 +44,7 @@ use reth_db_api::{
 use reth_etl::Collector;
 use reth_trie::{
     hashed_cursor::{HashedCursor, HashedCursorFactory},
-    trie_cursor::{depth_first::DepthFirstTrieIterator, TrieCursorFactory},
+    verify::{BranchNode, StateRootBranchNodesIter},
     Nibbles,
 };
 use serde::Serialize;
@@ -122,34 +122,28 @@ pub(crate) struct IdentifyStats {
     /// inactive emission) — go-ethereum's analogous `SnapshotMismatches` counter, renamed since
     /// reth has no snapshot layer; this is a miss against the ephemeral period index instead.
     pub(crate) period_lookup_misses: u64,
-    /// A `state_mask`/`tree_mask` nibble slot that should hold exactly one leaf (per the
-    /// invariant [`resolve_leaf`] relies on) had no matching entry in the hashed cursor at all —
-    /// diagnostic only, never expected to be nonzero; see [`resolve_leaf`]'s doc comment.
+    /// A `state_mask`-set, `tree_mask`-clear nibble slot ([`scan_leaf_cluster`]'s target) had no
+    /// matching entry in the hashed cursor at all. Since the walk recomputes the complete trie
+    /// from `HashedAccounts`/`HashedStorages` rather than reading a possibly-incomplete persisted
+    /// cache, this is a genuine invariant violation if it's ever nonzero — a real bug in
+    /// [`scan_leaf_cluster`] or the trie recomputation itself, not expected cache-gap noise.
     pub(crate) leaf_slot_prefix_mismatches: u64,
 }
 
-/// Walks the account trie (and, per `config.scope`, per-account storage tries), returning every
-/// maximal inactive subtree found plus run statistics. `state_root` is the chain header's known
-/// state root for the block being walked — see [`finalize_walk`] for why an external oracle is
-/// needed at all.
-pub(crate) fn identify<T: TrieCursorFactory, H: HashedCursorFactory>(
-    trie_cursor_factory: &T,
-    hashed_cursor_factory: &H,
+/// Walks the complete account trie (and, per `config.scope`, per-account storage tries),
+/// returning every maximal inactive subtree found plus run statistics. `state_root` is the chain
+/// header's known state root, used as the account trie's root hash — the freshly recomputed root
+/// node's own `root_hash` field is not reliably populated by `HashBuilder` in practice, so the
+/// header is the authoritative source instead (see [`finalize_walk`]).
+pub(crate) fn identify<H: HashedCursorFactory + Clone>(
+    hashed_cursor_factory: H,
     state_root: B256,
     period_index: &PeriodIndex,
     config: &IdentifyConfig,
 ) -> eyre::Result<(Vec<InactiveSubtree>, IdentifyStats)> {
     let mut stats = IdentifyStats::default();
     let mut subtrees = Vec::new();
-    walk_account_trie(
-        trie_cursor_factory,
-        hashed_cursor_factory,
-        state_root,
-        period_index,
-        config,
-        &mut stats,
-        &mut subtrees,
-    )?;
+    walk(hashed_cursor_factory, state_root, period_index, config, &mut stats, &mut subtrees)?;
     Ok((subtrees, stats))
 }
 
@@ -267,169 +261,267 @@ impl NodeFrame {
     }
 }
 
-fn walk_account_trie<T: TrieCursorFactory, H: HashedCursorFactory>(
-    trie_cursor_factory: &T,
-    hashed_cursor_factory: &H,
+/// Pops and folds every child frame on `stack` that `(path, branch)` closes (i.e. whose path is a
+/// proper descendant of `path`), returning the new, not-yet-pushed frame for `path`. Shared
+/// between the account-trie and per-owner storage-trie handling in [`walk`] — this part of the
+/// algorithm doesn't differ between the two.
+fn pop_closed_children(
+    stack: &mut Vec<NodeFrame>,
+    path: Nibbles,
+    branch: &BranchNodeCompact,
+    ctx: &mut EmitCtx<'_>,
+) -> NodeFrame {
+    let mut frame = NodeFrame::new(path, branch.root_hash);
+    while stack.last().is_some_and(|f| f.path.len() > path.len() && f.path.starts_with(&path)) {
+        let child = stack.pop().expect("checked above");
+        let nibble = child.path.get(path.len()).expect("child path longer than parent");
+        let hash = branch.hash_mask.is_bit_set(nibble).then(|| branch.hash_for_nibble(nibble));
+        fold_child(child, hash, &mut frame, ctx);
+    }
+    frame
+}
+
+/// Drives a single [`StateRootBranchNodesIter`], dispatching each incoming branch node to either
+/// the account-trie stack or whichever storage-trie stack is currently open. Storage nodes for one
+/// account always finish before the next account's storage nodes begin (the iterator's own
+/// ordering guarantee), which is the trigger for finalizing one owner's storage stack and starting
+/// the next — no recursion needed, unlike the old per-account `walk_storage_trie` call: storage
+/// descent now happens automatically, since `StateRoot::root_with_progress` always computes every
+/// account's storage root regardless of `config.scope` (it's needed for the account leaf's own RLP
+/// value). Under `Scope::Account`, incoming storage nodes are simply skipped rather than folded.
+fn walk<H: HashedCursorFactory + Clone>(
+    hashed_cursor_factory: H,
     state_root: B256,
     period_index: &PeriodIndex,
     config: &IdentifyConfig,
     stats: &mut IdentifyStats,
     subtrees: &mut Vec<InactiveSubtree>,
 ) -> eyre::Result<()> {
-    let cursor = trie_cursor_factory.account_trie_cursor()?;
-    let iter = DepthFirstTrieIterator::new(cursor);
-    let mut hashed_cursor = hashed_cursor_factory.hashed_account_cursor()?;
-    let emit_output = config.scope.emit_account();
+    let emit_account = config.scope.emit_account();
+    let descend_storage = config.scope.descend_storage();
 
-    let mut stack: Vec<NodeFrame> = Vec::new();
-    for item in iter {
-        let (path, branch) = item?;
-        let mut frame = NodeFrame::new(path, branch.root_hash);
+    let branch_iter = StateRootBranchNodesIter::new(hashed_cursor_factory.clone());
+    let mut account_hashed_cursor = hashed_cursor_factory.hashed_account_cursor()?;
 
-        while stack.last().is_some_and(|f| f.path.len() > path.len() && f.path.starts_with(&path)) {
-            let child = stack.pop().expect("checked above");
-            let nibble = child.path.get(path.len()).expect("child path longer than parent");
-            let hash = branch.hash_mask.is_bit_set(nibble).then(|| branch.hash_for_nibble(nibble));
-            let mut ctx =
-                EmitCtx { trie_label: "account", owner: B256::ZERO, emit_output, subtrees, stats };
-            fold_child(child, hash, &mut frame, &mut ctx);
-        }
+    let mut account_stack: Vec<NodeFrame> = Vec::new();
+    let mut storage_owner: Option<B256> = None;
+    let mut storage_stack: Vec<NodeFrame> = Vec::new();
+    let mut storage_hashed_cursor = None;
 
-        for nibble in 0u8..16 {
-            if !branch.state_mask.is_bit_set(nibble) || branch.tree_mask.is_bit_set(nibble) {
-                continue;
-            }
-            let mut leaf_prefix = path;
-            leaf_prefix.push(nibble);
-            let Some(hashed_key) = resolve_leaf(&leaf_prefix, &mut hashed_cursor)? else {
-                stats.leaf_slot_prefix_mismatches += 1;
-                continue
-            };
+    for item in branch_iter {
+        match item? {
+            BranchNode::Account(path, branch) => {
+                let mut frame = {
+                    let mut ctx = EmitCtx {
+                        trie_label: "account",
+                        owner: B256::ZERO,
+                        emit_output: emit_account,
+                        subtrees,
+                        stats,
+                    };
+                    pop_closed_children(&mut account_stack, path, &branch, &mut ctx)
+                };
 
-            frame.leaf_count += 1;
-            stats.accounts_scanned += 1;
-            let inactive = match period_index.account_block(hashed_key) {
-                Some(block) => config.is_inactive(block),
-                None => {
-                    stats.period_lookup_misses += 1;
-                    false
+                for nibble in 0u8..16 {
+                    if !branch.state_mask.is_bit_set(nibble) {
+                        continue;
+                    }
+                    if branch.tree_mask.is_bit_set(nibble) {
+                        // Arrives later as its own stream item; `pop_closed_children` handles it.
+                        continue;
+                    }
+
+                    let mut leaf_prefix = path;
+                    leaf_prefix.push(nibble);
+
+                    let cluster = scan_leaf_cluster(
+                        &leaf_prefix,
+                        &mut account_hashed_cursor,
+                        config,
+                        |key| period_index.account_block(key),
+                        &mut stats.accounts_scanned,
+                        &mut stats.period_lookup_misses,
+                    )?;
+                    if cluster.leaf_count == 0 {
+                        stats.leaf_slot_prefix_mismatches += 1;
+                        continue;
+                    }
+
+                    let hash =
+                        branch.hash_mask.is_bit_set(nibble).then(|| branch.hash_for_nibble(nibble));
+                    let mut ctx = EmitCtx {
+                        trie_label: "account",
+                        owner: B256::ZERO,
+                        emit_output: emit_account,
+                        subtrees,
+                        stats,
+                    };
+                    fold_child(cluster, hash, &mut frame, &mut ctx);
                 }
-            };
-            if !inactive {
-                frame.all_inactive = false;
-            }
 
-            if config.scope.descend_storage() {
-                stats.storage_tries_walked += 1;
-                walk_storage_trie(
-                    trie_cursor_factory,
-                    hashed_cursor_factory,
-                    hashed_key,
-                    period_index,
-                    config,
-                    stats,
-                    subtrees,
-                )?;
+                account_stack.push(frame);
+            }
+            BranchNode::Storage(owner, path, branch) => {
+                if !descend_storage {
+                    continue;
+                }
+                if storage_owner != Some(owner) {
+                    if let Some(prev_owner) = storage_owner.take() {
+                        let mut ctx = EmitCtx {
+                            trie_label: "storage",
+                            owner: prev_owner,
+                            emit_output: true,
+                            subtrees,
+                            stats,
+                        };
+                        finalize_walk(std::mem::take(&mut storage_stack), None, &mut ctx);
+                    }
+                    storage_owner = Some(owner);
+                    storage_hashed_cursor =
+                        Some(hashed_cursor_factory.hashed_storage_cursor(owner)?);
+                    stats.storage_tries_walked += 1;
+                }
+
+                let mut frame = {
+                    let mut ctx = EmitCtx {
+                        trie_label: "storage",
+                        owner,
+                        emit_output: true,
+                        subtrees,
+                        stats,
+                    };
+                    pop_closed_children(&mut storage_stack, path, &branch, &mut ctx)
+                };
+
+                let cursor = storage_hashed_cursor.as_mut().expect("just set above");
+                for nibble in 0u8..16 {
+                    if !branch.state_mask.is_bit_set(nibble) {
+                        continue;
+                    }
+                    if branch.tree_mask.is_bit_set(nibble) {
+                        continue;
+                    }
+
+                    let mut leaf_prefix = path;
+                    leaf_prefix.push(nibble);
+
+                    let cluster = scan_leaf_cluster(
+                        &leaf_prefix,
+                        cursor,
+                        config,
+                        |key| period_index.storage_block(owner, key),
+                        &mut stats.storage_slots_scanned,
+                        &mut stats.period_lookup_misses,
+                    )?;
+                    if cluster.leaf_count == 0 {
+                        stats.leaf_slot_prefix_mismatches += 1;
+                        continue;
+                    }
+
+                    let hash =
+                        branch.hash_mask.is_bit_set(nibble).then(|| branch.hash_for_nibble(nibble));
+                    let mut ctx = EmitCtx {
+                        trie_label: "storage",
+                        owner,
+                        emit_output: true,
+                        subtrees,
+                        stats,
+                    };
+                    fold_child(cluster, hash, &mut frame, &mut ctx);
+                }
+
+                storage_stack.push(frame);
             }
         }
-
-        stack.push(frame);
     }
 
-    let mut ctx =
-        EmitCtx { trie_label: "account", owner: B256::ZERO, emit_output, subtrees, stats };
-    finalize_walk(stack, Some(state_root), &mut ctx);
+    if let Some(prev_owner) = storage_owner {
+        let mut ctx = EmitCtx {
+            trie_label: "storage",
+            owner: prev_owner,
+            emit_output: true,
+            subtrees,
+            stats,
+        };
+        // No external oracle exists for a storage trie's own root hash (unlike the account trie,
+        // where the chain header provides one) — `Account` carries no `storage_root` field, it's
+        // computed only at hash-time. `finalize_walk` handles that gracefully: a `None` root hash
+        // just means the whole-storage-trie candidate can't be formed, falling back to flushing
+        // whatever inner candidates it collected instead.
+        finalize_walk(storage_stack, None, &mut ctx);
+    }
+
+    let mut ctx = EmitCtx {
+        trie_label: "account",
+        owner: B256::ZERO,
+        emit_output: emit_account,
+        subtrees,
+        stats,
+    };
+    finalize_walk(account_stack, Some(state_root), &mut ctx);
 
     Ok(())
 }
 
-fn walk_storage_trie<T: TrieCursorFactory, H: HashedCursorFactory>(
-    trie_cursor_factory: &T,
-    hashed_cursor_factory: &H,
-    owner: B256,
-    period_index: &PeriodIndex,
-    config: &IdentifyConfig,
-    stats: &mut IdentifyStats,
-    subtrees: &mut Vec<InactiveSubtree>,
-) -> eyre::Result<()> {
-    let cursor = trie_cursor_factory.storage_trie_cursor(owner)?;
-    let iter = DepthFirstTrieIterator::new(cursor);
-    let mut hashed_cursor = hashed_cursor_factory.hashed_storage_cursor(owner)?;
-
-    let mut stack: Vec<NodeFrame> = Vec::new();
-    for item in iter {
-        let (path, branch) = item?;
-        let mut frame = NodeFrame::new(path, branch.root_hash);
-
-        while stack.last().is_some_and(|f| f.path.len() > path.len() && f.path.starts_with(&path)) {
-            let child = stack.pop().expect("checked above");
-            let nibble = child.path.get(path.len()).expect("child path longer than parent");
-            let hash = branch.hash_mask.is_bit_set(nibble).then(|| branch.hash_for_nibble(nibble));
-            let mut ctx =
-                EmitCtx { trie_label: "storage", owner, emit_output: true, subtrees, stats };
-            fold_child(child, hash, &mut frame, &mut ctx);
-        }
-
-        for nibble in 0u8..16 {
-            if !branch.state_mask.is_bit_set(nibble) || branch.tree_mask.is_bit_set(nibble) {
-                continue;
-            }
-            let mut leaf_prefix = path;
-            leaf_prefix.push(nibble);
-            let Some(hashed_slot) = resolve_leaf(&leaf_prefix, &mut hashed_cursor)? else {
-                stats.leaf_slot_prefix_mismatches += 1;
-                continue;
-            };
-
-            frame.leaf_count += 1;
-            stats.storage_slots_scanned += 1;
-            let inactive = match period_index.storage_block(owner, hashed_slot) {
-                Some(block) => config.is_inactive(block),
-                None => {
-                    stats.period_lookup_misses += 1;
-                    false
-                }
-            };
-            if !inactive {
-                frame.all_inactive = false;
-            }
-        }
-
-        stack.push(frame);
-    }
-
-    // No external oracle exists for a storage trie's own root hash (unlike the account trie,
-    // where the chain header provides one) — `Account` carries no `storage_root` field, it's
-    // computed only at hash-time. `finalize_walk` handles that gracefully: a `None` root hash
-    // just means the whole-storage-trie candidate can't be formed, falling back to flushing
-    // whatever inner candidates it collected instead.
-    let mut ctx = EmitCtx { trie_label: "storage", owner, emit_output: true, subtrees, stats };
-    finalize_walk(stack, None, &mut ctx);
-
-    Ok(())
-}
-
-/// Seeks `cursor` to the first hashed entry at or after `leaf_prefix` (zero-padded to a full
-/// 32-byte key) and returns its key, or `None` if no entry actually starts with `leaf_prefix`
-/// (defensive — `state_mask`/`tree_mask` are *expected* to guarantee exactly one such entry, but
-/// a mismatch is treated as a miss rather than trusted blindly). Note this expectation can be
-/// wrong in a different way that this check can't catch: if more than one hashed entry shares
-/// `leaf_prefix` (an uncached subtree — see this module's top-level docs), only the first is
-/// returned and the rest are silently invisible to the walk, with no mismatch to report.
-fn resolve_leaf<C: HashedCursor>(
-    leaf_prefix: &Nibbles,
-    cursor: &mut C,
-) -> eyre::Result<Option<B256>> {
+/// Zero-pads `leaf_prefix` (nibbles) out to a full 32-byte key suitable for
+/// [`HashedCursor::seek`]. `pub(crate)` (rather than private) so `convert_inactive::capture` can
+/// reuse it for its own prefix scans instead of duplicating the same packing logic.
+pub(crate) fn pack_seek_key(leaf_prefix: &Nibbles) -> B256 {
     let mut buf = [0u8; 32];
     let packed = leaf_prefix.pack();
     buf[..packed.len()].copy_from_slice(&packed);
-    let seek_key = B256::from(buf);
+    B256::from(buf)
+}
 
-    let Some((key, _value)) = cursor.seek(seek_key)? else { return Ok(None) };
-    if !Nibbles::unpack(key).starts_with(leaf_prefix) {
-        return Ok(None);
+/// Scans every hashed-cursor entry whose key starts with `leaf_prefix`, folding each in as an
+/// individual leaf via `period_lookup`, and returns the resulting cluster as a standalone
+/// [`NodeFrame`] (not yet folded into anything — the caller does that via [`fold_child`], passing
+/// the cluster's hash from the parent branch node's `hash_for_nibble` when `hash_mask` has it,
+/// or `None` otherwise — `fold_child` already handles a hashless fully-inactive child correctly
+/// by bubbling its (empty, for a single leaf) candidate list up instead of trying to stand it up
+/// as its own candidate).
+///
+/// This always scans rather than trusting a single seek, because neither `tree_mask` nor
+/// `hash_mask` reliably distinguishes "exactly one leaf" from "a real multi-leaf branch" for a
+/// `state_mask`-set, `tree_mask`-clear nibble: `hash_mask` is set when a branch node's hash is
+/// pushed directly, but alloy-trie's `HashBuilder::update_masks` *clears* it again whenever an
+/// extension node (a shared-nibble-prefix run) sits between this position and that branch — see
+/// this module's top-level docs. So a real multi-leaf branch reached via an extension looks
+/// identical, mask-wise, to a single leaf; only actually scanning the hashed entries tells them
+/// apart.
+fn scan_leaf_cluster<C: HashedCursor>(
+    leaf_prefix: &Nibbles,
+    cursor: &mut C,
+    config: &IdentifyConfig,
+    mut period_lookup: impl FnMut(B256) -> Option<BlockNumber>,
+    scanned: &mut u64,
+    period_lookup_misses: &mut u64,
+) -> eyre::Result<NodeFrame> {
+    let mut cluster = NodeFrame::new(*leaf_prefix, None);
+
+    let mut entry = cursor.seek(pack_seek_key(leaf_prefix))?;
+    while let Some((key, _value)) = entry {
+        if !Nibbles::unpack(key).starts_with(leaf_prefix) {
+            break;
+        }
+
+        cluster.leaf_count += 1;
+        *scanned += 1;
+        let inactive = match period_lookup(key) {
+            Some(block) => config.is_inactive(block),
+            None => {
+                *period_lookup_misses += 1;
+                false
+            }
+        };
+        if !inactive {
+            cluster.all_inactive = false;
+        }
+
+        entry = cursor.next()?;
     }
-    Ok(Some(key))
+
+    Ok(cluster)
 }
 
 /// Bundles the per-trie-walk constants (which trie, whose storage, whether output is enabled for
@@ -482,21 +574,24 @@ fn fold_child(
 
 /// Resolves whatever frame(s) are left on the stack once a trie walk's iterator is exhausted.
 ///
-/// Unlike go-ethereum's raw trie, reth's persisted trie tables don't necessarily contain a row
-/// for the absolute trie root: when every one of the 16 top-level nibbles is itself a further
-/// branch, reth stores 16 independent single-nibble rows and no combining row at the empty path
-/// at all (its hash is redundant with the block header's `state_root`, so nothing re-persists
-/// it). So after the walk, `stack` may hold anywhere from zero to sixteen unresolved top-level
-/// frames instead of the single finished root [`fold_child`]/[`finalize_root`] alone assume.
+/// Because the walk now recomputes the complete trie via [`StateRootBranchNodesIter`] rather than
+/// reading persisted rows, `stack` should always hold exactly one frame whose path is empty — the
+/// true root, guaranteed to be the last item `HashBuilder` folds. The general handling below is
+/// kept as a defensive fallback rather than assumed away entirely (e.g. it also protects against a
+/// bug in this module's own owner-boundary tracking leaving stray frames behind), not because
+/// reth's trie tables are known to omit rows the way the old persisted-cache-based walk had to
+/// account for.
 ///
 /// - Zero frames: an empty trie, nothing to report.
-/// - One frame whose path is already empty: a real persisted root row exists — finalize it
-///   directly, preferring its own `root_hash` but falling back to `known_root_hash` if unset.
-/// - Otherwise: no single row represents the root. Synthesize one at the empty path, using
-///   `known_root_hash` (the chain header's state root for the account trie; `None` for storage
-///   tries, which have no such external oracle — `Account` carries no `storage_root` field, it's
-///   only computed at hash-time). Each remaining top-level frame folds in "embedded"-style (its own
-///   hash isn't known — there's no parent row to read a `hash_mask` from), so its inner candidates
+/// - One frame whose path is already empty (the expected case): finalize it directly, preferring
+///   its own `root_hash` but falling back to `known_root_hash` if unset — in practice `root_hash`
+///   is essentially never populated by `HashBuilder`, so `known_root_hash` (the chain header's
+///   state root for the account trie; `None` for storage tries, which have no such external oracle
+///   — `Account` carries no `storage_root` field, it's only computed at hash-time) is the one that
+///   actually matters.
+/// - Otherwise (should not normally happen): synthesize a root at the empty path from
+///   `known_root_hash`. Each remaining top-level frame folds in "embedded"-style (its own hash
+///   isn't known — there's no parent row to read a `hash_mask` from), so its inner candidates
 ///   bubble up rather than becoming one top-level candidate on their own.
 fn finalize_walk(mut stack: Vec<NodeFrame>, known_root_hash: Option<B256>, ctx: &mut EmitCtx<'_>) {
     if stack.is_empty() {
@@ -811,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_leaf_prefix_mismatch_is_treated_as_miss() {
+    fn test_scan_leaf_cluster_no_match_returns_empty() {
         use reth_trie::hashed_cursor::mock::MockHashedCursorFactory;
         use std::collections::BTreeMap;
 
@@ -822,6 +917,50 @@ mod tests {
         let mut cursor = factory.hashed_account_cursor().unwrap();
 
         let prefix = Nibbles::from_nibbles([0xf]);
-        assert_eq!(resolve_leaf(&prefix, &mut cursor).unwrap(), None);
+        let cfg = config(0, 0);
+        let mut scanned = 0u64;
+        let mut misses = 0u64;
+        let cluster =
+            scan_leaf_cluster(&prefix, &mut cursor, &cfg, |_| None, &mut scanned, &mut misses)
+                .unwrap();
+
+        assert_eq!(cluster.leaf_count, 0);
+        assert_eq!(scanned, 0);
+    }
+
+    #[test]
+    fn test_scan_leaf_cluster_finds_every_leaf_under_a_shared_prefix() {
+        // The actual regression this module's bug fix is about: a `tree_mask`-clear nibble can
+        // hide more than one leaf (a shallow branch, or one reached via an extension node), and
+        // trusting a single seek silently drops every leaf after the first. `scan_leaf_cluster`
+        // must find all of them.
+        use reth_trie::hashed_cursor::mock::MockHashedCursorFactory;
+        use std::collections::BTreeMap;
+
+        let mut accounts = BTreeMap::new();
+        let mut key_a = [0u8; 32];
+        key_a[0] = 0x0a; // nibble path: 0, a, ...
+        let mut key_b = [0u8; 32];
+        key_b[0] = 0x0b; // nibble path: 0, b, ... — shares the `0` prefix with key_a
+        let mut key_c = [0u8; 32];
+        key_c[0] = 0x10; // nibble path: 1, ... — outside the `0` prefix
+        accounts.insert(B256::from(key_a), reth_primitives_traits::Account::default());
+        accounts.insert(B256::from(key_b), reth_primitives_traits::Account::default());
+        accounts.insert(B256::from(key_c), reth_primitives_traits::Account::default());
+
+        let factory = MockHashedCursorFactory::new(accounts, Default::default());
+        let mut cursor = factory.hashed_account_cursor().unwrap();
+
+        let prefix = Nibbles::from_nibbles([0x0]);
+        let cfg = config(0, 0);
+        let mut scanned = 0u64;
+        let mut misses = 0u64;
+        let cluster =
+            scan_leaf_cluster(&prefix, &mut cursor, &cfg, |_| None, &mut scanned, &mut misses)
+                .unwrap();
+
+        assert_eq!(cluster.leaf_count, 2, "both key_a and key_b share the `0` prefix");
+        assert_eq!(scanned, 2);
+        assert_eq!(misses, 2, "period_lookup returns None for both in this test");
     }
 }
