@@ -4,13 +4,21 @@
 //! `geth db inject-periods` (`cmd/geth/dbcmd_eip8188.go`), adapted to reth's sibling-table
 //! design (see `crates/storage/db-api/src/tables/mod.rs`) instead of go-ethereum's in-place
 //! snapshot patch.
+//!
+//! Existence of a diff's key in current state is checked against whichever table the running
+//! node's [`StorageSettings`] actually keeps current state in: `PlainAccountState` /
+//! `PlainStorageState` under the v1 layout, or `HashedAccounts` / `HashedStorages` (keyed by
+//! `keccak256`) under the v2 layout — see [`StorageSettingsCache::cached_storage_settings`] and
+//! [`StorageSettings::use_hashed_state`]. The sibling tables themselves stay keyed by plain
+//! `Address`/`StorageKey` either way, since [`crate::db::inactive_identifier`] hashes them
+//! itself when correlating against the trie.
 
 use crate::db::{
     periods_clickhouse::{ClickHouseConfig, ClickHouseSource},
     periods_file::FileSource,
     periods_source::{AccountDiff, Source, StorageDiff, DEFAULT_BLOCKS_PER_PERIOD},
 };
-use alloy_primitives::BlockNumber;
+use alloy_primitives::{keccak256, BlockNumber};
 use clap::Parser;
 use reth_db_api::{
     cursor::DbDupCursorRO,
@@ -22,7 +30,7 @@ use reth_db_api::{
 use reth_db_common::DbTool;
 use reth_node_api::NodeTypesWithDB;
 use reth_provider::providers::ProviderNodeTypes;
-use reth_storage_api::BlockNumReader;
+use reth_storage_api::{BlockNumReader, StorageSettingsCache};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -186,18 +194,26 @@ pub(crate) async fn inject<N: NodeTypesWithDB>(
     Ok(stats)
 }
 
-/// Read-only scan: which `chunk` entries are present in `PlainAccountState` and need an
-/// `AccountLastWritten` write (missing row, or a different block than what's stored).
-/// Shared between the dry-run (`view`) and real (`update`) transaction paths below — a `?
-/// DbTxMut` bound isn't needed here since nothing is written.
+/// Read-only scan: which `chunk` entries are present in current account state and need an
+/// `AccountLastWritten` write (missing row, or a different block than what's stored). Current
+/// state lives in `PlainAccountState` under the v1 layout, or `HashedAccounts` (keyed by
+/// `keccak256(address)`) under v2 — `use_hashed_state` selects which. Shared between the
+/// dry-run (`view`) and real (`update`) transaction paths below — a `DbTxMut` bound isn't
+/// needed here since nothing is written.
 fn accounts_needing_write<'a, Tx: DbTx>(
     tx: &Tx,
     chunk: &'a [AccountDiff],
+    use_hashed_state: bool,
 ) -> eyre::Result<(Vec<&'a AccountDiff>, u64)> {
     let mut needs_write = Vec::new();
     let mut missing = 0u64;
     for diff in chunk {
-        if tx.get::<tables::PlainAccountState>(diff.address)?.is_none() {
+        let exists = if use_hashed_state {
+            tx.get::<tables::HashedAccounts>(keccak256(diff.address))?.is_some()
+        } else {
+            tx.get::<tables::PlainAccountState>(diff.address)?.is_some()
+        };
+        if !exists {
             missing += 1;
             continue;
         }
@@ -222,6 +238,8 @@ async fn inject_accounts<N: NodeTypesWithDB>(
     let diffs = source.account_diffs(fork_block, end_block).await?;
     stats.account_diffs_seen += diffs.len() as u64;
 
+    let use_hashed_state = tool.provider_factory.cached_storage_settings().use_hashed_state();
+
     let mut last_progress = Instant::now();
     for chunk in diffs.chunks(batch_size) {
         // `--dry-run` opens the environment read-only (see `Command::execute`), so it must use
@@ -229,12 +247,12 @@ async fn inject_accounts<N: NodeTypesWithDB>(
         // and errors out against a read-only-opened environment.
         let (written, missing) = if dry_run {
             tool.provider_factory.db_ref().view(|tx| -> eyre::Result<(u64, u64)> {
-                let (needs_write, missing) = accounts_needing_write(tx, chunk)?;
+                let (needs_write, missing) = accounts_needing_write(tx, chunk, use_hashed_state)?;
                 Ok((needs_write.len() as u64, missing))
             })??
         } else {
             tool.provider_factory.db_ref().update(|tx| -> eyre::Result<(u64, u64)> {
-                let (needs_write, missing) = accounts_needing_write(tx, chunk)?;
+                let (needs_write, missing) = accounts_needing_write(tx, chunk, use_hashed_state)?;
                 for diff in &needs_write {
                     tx.put::<tables::AccountLastWritten>(diff.address, diff.block)?;
                 }
@@ -252,27 +270,51 @@ async fn inject_accounts<N: NodeTypesWithDB>(
     Ok(())
 }
 
-/// Read-only scan: which `chunk` entries are present in `PlainStorageState` and need a
-/// `StorageLastWritten` write. See [`accounts_needing_write`] for why this is split out.
+/// Read-only scan: which `chunk` entries are present in current storage state and need a
+/// `StorageLastWritten` write. Current state lives in `PlainStorageState` under the v1 layout,
+/// or `HashedStorages` (keyed by `keccak256(address)` / `keccak256(slot)`) under v2 — see
+/// [`accounts_needing_write`] for why this is split out and how `use_hashed_state` is derived.
 fn storage_needing_write<'a, Tx: DbTx>(
     tx: &Tx,
     chunk: &'a [StorageDiff],
+    use_hashed_state: bool,
 ) -> eyre::Result<(Vec<(&'a StorageDiff, AddressStorageKey)>, u64)> {
-    let mut cursor = tx.cursor_dup_read::<tables::PlainStorageState>()?;
     let mut needs_write = Vec::new();
     let mut missing = 0u64;
-    for diff in chunk {
-        if cursor.seek_by_key_subkey(diff.address, diff.slot)?.is_none() {
-            missing += 1;
-            continue;
+
+    if use_hashed_state {
+        let mut cursor = tx.cursor_dup_read::<tables::HashedStorages>()?;
+        for diff in chunk {
+            if cursor
+                .seek_by_key_subkey(keccak256(diff.address), keccak256(diff.slot))?
+                .is_none()
+            {
+                missing += 1;
+                continue;
+            }
+            let key = AddressStorageKey((diff.address, diff.slot));
+            let current = tx.get::<tables::StorageLastWritten>(key)?;
+            if current == Some(diff.block) {
+                continue; // idempotent no-op
+            }
+            needs_write.push((diff, key));
         }
-        let key = AddressStorageKey((diff.address, diff.slot));
-        let current = tx.get::<tables::StorageLastWritten>(key)?;
-        if current == Some(diff.block) {
-            continue; // idempotent no-op
+    } else {
+        let mut cursor = tx.cursor_dup_read::<tables::PlainStorageState>()?;
+        for diff in chunk {
+            if cursor.seek_by_key_subkey(diff.address, diff.slot)?.is_none() {
+                missing += 1;
+                continue;
+            }
+            let key = AddressStorageKey((diff.address, diff.slot));
+            let current = tx.get::<tables::StorageLastWritten>(key)?;
+            if current == Some(diff.block) {
+                continue; // idempotent no-op
+            }
+            needs_write.push((diff, key));
         }
-        needs_write.push((diff, key));
     }
+
     Ok((needs_write, missing))
 }
 
@@ -288,16 +330,18 @@ async fn inject_storage<N: NodeTypesWithDB>(
     let diffs = source.storage_diffs(fork_block, end_block).await?;
     stats.storage_diffs_seen += diffs.len() as u64;
 
+    let use_hashed_state = tool.provider_factory.cached_storage_settings().use_hashed_state();
+
     let mut last_progress = Instant::now();
     for chunk in diffs.chunks(batch_size) {
         let (written, missing) = if dry_run {
             tool.provider_factory.db_ref().view(|tx| -> eyre::Result<(u64, u64)> {
-                let (needs_write, missing) = storage_needing_write(tx, chunk)?;
+                let (needs_write, missing) = storage_needing_write(tx, chunk, use_hashed_state)?;
                 Ok((needs_write.len() as u64, missing))
             })??
         } else {
             tool.provider_factory.db_ref().update(|tx| -> eyre::Result<(u64, u64)> {
-                let (needs_write, missing) = storage_needing_write(tx, chunk)?;
+                let (needs_write, missing) = storage_needing_write(tx, chunk, use_hashed_state)?;
                 for (diff, key) in &needs_write {
                     tx.put::<tables::StorageLastWritten>(*key, diff.block)?;
                 }
@@ -476,5 +520,85 @@ mod tests {
             .view(|tx| tx.get::<tables::AccountLastWritten>(alice).unwrap())
             .unwrap();
         assert_eq!(alice_block, None, "dry-run must not mutate disk");
+    }
+
+    /// Seeds `HashedAccounts` (alice, bob) and `HashedStorages` (alice, slot1) — the v2
+    /// equivalent of [`seed`] — and marks the test factory as v2 so `use_hashed_state()` picks
+    /// the hashed tables up. Regression test for the bug where `inject-periods` only ever
+    /// checked `PlainAccountState`/`PlainStorageState`, so it silently wrote nothing against
+    /// any v2 (`storage_v2 = true`) database.
+    fn seed_hashed(
+        tool: &DbTool<reth_provider::test_utils::MockNodeTypesWithDB>,
+    ) -> (Address, Address, StorageKey) {
+        let alice = Address::from([0xaa; 20]);
+        let bob = Address::from([0xbb; 20]);
+        let slot1 = StorageKey::from([0x01; 32]);
+
+        tool.provider_factory.set_storage_settings_cache(reth_storage_api::StorageSettings::v2());
+
+        tool.provider_factory
+            .db_ref()
+            .update(|tx| -> Result<(), reth_db_api::DatabaseError> {
+                tx.put::<tables::HashedAccounts>(
+                    keccak256(alice),
+                    Account { nonce: 1, balance: U256::from(100), bytecode_hash: None },
+                )?;
+                tx.put::<tables::HashedAccounts>(
+                    keccak256(bob),
+                    Account { nonce: 0, balance: U256::from(1), bytecode_hash: None },
+                )?;
+                tx.put::<tables::HashedStorages>(
+                    keccak256(alice),
+                    StorageEntry { key: keccak256(slot1), value: U256::from(0xdeadbeefu64) },
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+
+        (alice, bob, slot1)
+    }
+
+    #[tokio::test]
+    async fn test_inject_v2_hashed_state() {
+        let tool = test_tool();
+        let (alice, bob, slot1) = seed_hashed(&tool);
+
+        let source = FakeSource {
+            accounts: vec![
+                AccountDiff { address: alice, block: 10 },
+                AccountDiff { address: bob, block: 42 },
+            ],
+            storage: vec![StorageDiff { address: alice, slot: slot1, block: 30 }],
+        };
+
+        let stats = inject(&tool, &source, 0, 50, 10_000, false).await.unwrap();
+        assert_eq!(
+            stats.account_rows_written, 2,
+            "accounts present in HashedAccounts must not be reported as missing plain state"
+        );
+        assert_eq!(stats.account_rows_missing_plain_state, 0);
+        assert_eq!(
+            stats.storage_rows_written, 1,
+            "slots present in HashedStorages must not be reported as missing plain state"
+        );
+        assert_eq!(stats.storage_rows_missing_plain_state, 0);
+
+        // Sibling tables stay keyed by the plain address/slot regardless of the v2 lookup path.
+        let alice_block = tool
+            .provider_factory
+            .db_ref()
+            .view(|tx| tx.get::<tables::AccountLastWritten>(alice).unwrap())
+            .unwrap();
+        assert_eq!(alice_block, Some(10));
+
+        let slot_block = tool
+            .provider_factory
+            .db_ref()
+            .view(|tx| {
+                tx.get::<tables::StorageLastWritten>(AddressStorageKey((alice, slot1))).unwrap()
+            })
+            .unwrap();
+        assert_eq!(slot_block, Some(30));
     }
 }
